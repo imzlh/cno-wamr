@@ -5033,7 +5033,11 @@ wasm_runtime_invoke_native_raw(WASMExecEnv *exec_env, void *func_ptr,
                 if (!wasm_externref_ref2obj(externref_idx, &externref_obj))
                     goto fail;
 
-                bh_memcpy_s(argv_dst, sizeof(uintptr_t), argv_src,
+                /* Pass the host object resolved above to raw native imports.
+                 * Copying from argv_src here skips the resolved externref and
+                 * hands the trampoline the next wasm cell (or uninitialised
+                 * data for the last parameter). */
+                bh_memcpy_s(argv_dst, sizeof(uintptr_t), &externref_obj,
                             sizeof(uintptr_t));
                 break;
             }

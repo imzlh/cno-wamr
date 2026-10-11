@@ -17,7 +17,7 @@ function help()
     echo "test_wamr.sh [options]"
     echo "-c clean previous test results, not start test"
     echo "-s {suite_name} test only one suite (spec|standalone|malformed|wasi_certification|"
-    echo "                                     unit|wamr_compiler)"
+    echo "                                     unit|wamr_compiler|regression)"
     echo "-m set compile target of iwasm(x86_64|x86_32|armv7|armv7_vfp|thumbv7|thumbv7_vfp|"
     echo "                               riscv32|riscv32_ilp32f|riscv32_ilp32d|riscv64|"
     echo "                               riscv64_lp64f|riscv64_lp64d|aarch64|aarch64_vfp)"
@@ -47,6 +47,7 @@ function help()
     echo "-A use the specified wamrc command instead of building it"
     echo "-N enable extended const expression feature"
     echo "-U enable full unit test (passes FULL_TEST=ON to cmake when -s unit is used)"
+    echo "   unit tests skip fast-jit and multi-tier-jit until cases are available"
     echo "-r [requirement name] [N [N ...]] specify a requirement name followed by one or more"
     echo "                                  subrequirement IDs, if no subrequirement is specificed,"
     echo "                                  it will run all subrequirements. When this optin is used,"
@@ -73,6 +74,7 @@ ENABLE_EH=0
 ENABLE_DEBUG_VERSION=0
 ENABLE_GC_HEAP_VERIFY=0
 UNIT_FULL_TEST=0
+UNIT_TEST_BUILD_DIRS=()
 #unit test case arrary
 TEST_CASE_ARR=()
 SGX_OPT=""
@@ -334,21 +336,106 @@ readonly COMPILE_FLAGS=(
 
 function unit_test()
 {
-    echo "Now start unit tests"
-
     cd ${WORK_DIR}
-    rm -fr unittest-build
-
-    echo "Build unit test"
     touch ${REPORT_DIR}/unit_test_report.txt
-    cmake -S ${WORK_DIR}/../../unit -B unittest-build \
-      -DCOLLECT_CODE_COVERAGE=${COLLECT_CODE_COVERAGE} \
-      -DFULL_TEST=${UNIT_FULL_TEST} \
-      -DWAMRC_COMPILER_DIR=${WAMR_DIR}/wamr-compiler/build
-    cmake --build unittest-build
-    ctest --test-dir unittest-build --output-on-failure | tee -a ${REPORT_DIR}/unit_test_report.txt
 
-    echo "Finish unit tests"
+    for unit_mode in "${TYPE[@]}"; do
+        case ${unit_mode} in
+            fast-jit|multi-tier-jit)
+                echo "Skip unit tests in ${unit_mode}: no test cases available"
+                continue
+                ;;
+            classic-interp)
+                unit_mode_flags="${CLASSIC_INTERP_COMPILE_FLAGS}"
+                ;;
+            fast-interp)
+                unit_mode_flags="${FAST_INTERP_COMPILE_FLAGS}"
+                ;;
+            jit)
+                unit_mode_flags="-DWAMR_BUILD_TARGET=${TARGET} \
+                    -DWAMR_BUILD_INTERP=0 -DWAMR_BUILD_FAST_INTERP=0 \
+                    -DWAMR_BUILD_JIT=1 -DWAMR_BUILD_AOT=0 \
+                    -DWAMR_BUILD_FAST_JIT=0"
+                ;;
+            aot)
+                unit_mode_flags="${AOT_COMPILE_FLAGS}"
+                if [[ -z "${WAMRC_CMD}" ]]; then
+                    build_wamrc
+                    WAMRC_CMD=${WAMRC_CMD_DEFAULT}
+                fi
+                ;;
+            *)
+                echo "unexpected unit test mode: ${unit_mode}"
+                return 1
+                ;;
+        esac
+
+        local unit_build_dir="${WORK_DIR}/unittest-build-${unit_mode}"
+        echo "Now start unit tests in ${unit_mode}"
+        rm -fr "${unit_build_dir}"
+        UNIT_TEST_BUILD_DIRS+=("${unit_build_dir}")
+
+        echo "Build unit test"
+        cmake -S "${WORK_DIR}/../../unit" -B "${unit_build_dir}" \
+          ${unit_mode_flags} \
+          -DCOLLECT_CODE_COVERAGE="${COLLECT_CODE_COVERAGE}" \
+          -DFULL_TEST="${UNIT_FULL_TEST}" \
+          -DWAMRC_ROOT="$(dirname "${WAMRC_CMD}")"
+        cmake --build "${unit_build_dir}"
+        ctest --test-dir "${unit_build_dir}" --output-on-failure \
+          | tee -a "${REPORT_DIR}/unit_test_report.txt"
+        local ctest_status=${PIPESTATUS[0]}
+        if [[ ${ctest_status} -ne 0 ]]; then
+            return ${ctest_status}
+        fi
+        echo "Finish unit tests in ${unit_mode}"
+    done
+}
+
+function regression_test()
+{
+    cd ${WORK_DIR}
+    touch ${REPORT_DIR}/regression_test_report.txt
+
+    # build_run.py must run from the ba-issues directory (it uses relative
+    # paths for running_config.json, issues/ and build/).
+    local regression_dir="${WAMR_DIR}/tests/regression/ba-issues"
+
+    for reg_mode in "${TYPE[@]}"; do
+        case ${reg_mode} in
+            multi-tier-jit)
+                echo "Skip regression tests in ${reg_mode}: no test cases available"
+                continue
+                ;;
+            jit)
+                # test_wamr.sh names the LLVM JIT mode 'jit', build_run.py
+                # calls it 'llvm-jit'
+                run_mode="llvm-jit"
+                ;;
+            classic-interp|fast-interp|aot|fast-jit)
+                run_mode="${reg_mode}"
+                ;;
+            *)
+                echo "unexpected regression test mode: ${reg_mode}"
+                return 1
+                ;;
+        esac
+
+        echo "Now start regression tests in ${reg_mode}"
+        local build_run_args=("--mode" "${run_mode}")
+        if [[ ${COLLECT_CODE_COVERAGE} == 1 ]]; then
+            build_run_args+=("--coverage")
+        fi
+
+        ( cd "${regression_dir}" \
+            && ${PYTHON_EXE} build_run.py "${build_run_args[@]}" ) \
+            | tee -a "${REPORT_DIR}/regression_test_report.txt"
+        local reg_status=${PIPESTATUS[0]}
+        if [[ ${reg_status} -ne 0 ]]; then
+            return ${reg_status}
+        fi
+        echo "Finish regression tests in ${reg_mode}"
+    done
 }
 
 function sightglass_test()
@@ -375,6 +462,21 @@ function sightglass_test()
     fi
 
     echo "Finish sightglass benchmark tests"
+}
+
+# Fetch ${2} into ${1}. curl ships with every hosted runner image and wget no
+# longer does (windows-2022 dropped it), but container images may carry either
+# one, so fall back to wget when curl is missing.
+function download_file()
+{
+    local dest=$1
+    local url=$2
+
+    if command -v curl > /dev/null 2>&1; then
+        curl -fL -o "${dest}" "${url}"
+    else
+        wget -O "${dest}" --progress=dot:giga "${url}"
+    fi
 }
 
 function setup_wabt()
@@ -406,7 +508,7 @@ function setup_wabt()
         local WAT2WASM=${WORK_DIR}/wabt/out/gcc/Release/wat2wasm
         if [ ! -f ${WAT2WASM} ]; then
             pushd /tmp
-            wget -O wabt-tar.gz --progress=dot:giga ${WABT_URL}
+            download_file wabt-tar.gz ${WABT_URL} || exit 1
             tar xf wabt-tar.gz
             popd
 
@@ -890,19 +992,27 @@ function collect_coverage()
         fi
 
         pushd ${WORK_DIR} > /dev/null 2>&1
-        echo "Collect code coverage of iwasm"
-        ./collect_coverage.sh ${CODE_COV_FILE} ${IWASM_LINUX_ROOT_DIR}/build
-        if [[ $1 == "llvm-aot" ]]; then
-            echo "Collect code coverage of wamrc"
-            ./collect_coverage.sh ${CODE_COV_FILE} ${WAMR_DIR}/wamr-compiler/build
-        fi
-        for suite in "${TEST_CASE_ARR[@]}"; do
-            if [[ ${suite} = "unit" ]]; then
-                echo "Collect code coverage of unit test"
-                ./collect_coverage.sh ${CODE_COV_FILE} ${WORK_DIR}/unittest-build
-                break
+        if [[ $1 == "unit" ]]; then
+            for unit_build_dir in "${UNIT_TEST_BUILD_DIRS[@]}"; do
+                echo "Collect code coverage of unit test: ${unit_build_dir}"
+                ./collect_coverage.sh ${CODE_COV_FILE} ${unit_build_dir}
+            done
+        elif [[ $1 == "regression" ]]; then
+            local regression_dir="${WAMR_DIR}/tests/regression/ba-issues"
+            for regression_build_dir in "${regression_dir}"/build/build-iwasm-*; do
+                if [[ -d "${regression_build_dir}" ]]; then
+                    echo "Collect code coverage of regression test: ${regression_build_dir}"
+                    ./collect_coverage.sh ${CODE_COV_FILE} ${regression_build_dir}
+                fi
+            done
+        else
+            echo "Collect code coverage of iwasm"
+            ./collect_coverage.sh ${CODE_COV_FILE} ${IWASM_LINUX_ROOT_DIR}/build
+            if [[ $1 == "llvm-aot" ]]; then
+                echo "Collect code coverage of wamrc"
+                ./collect_coverage.sh ${CODE_COV_FILE} ${WAMR_DIR}/wamr-compiler/build
             fi
-        done
+        fi
         popd > /dev/null 2>&1
     else
         echo "code coverage isn't collected"
@@ -1222,26 +1332,9 @@ function remove_empty_elements()
     echo "${new_arr[@]}"
 }
 
-if [[ $TEST_CASE_ARR ]];then
-    # Check if 'unit' is in TEST_CASE_ARR
-    if [[ " ${TEST_CASE_ARR[@]} " =~ " unit " ]]; then
-        # unit test cases are designed with specific compilation flags
-        # and run under specific modes.
-        # There is no need to loop through all running modes in this script.
-        unit_test || (echo "TEST FAILED"; exit 1)
-        collect_coverage unit
-
-        # remove 'unit' from TEST_CASE_ARR
-        TEST_CASE_ARR=("${TEST_CASE_ARR[@]/unit}")
-        # remove empty elements from TEST_CASE_ARR
-        TEST_CASE_ARR=($(remove_empty_elements "${TEST_CASE_ARR[@]}"))
-    fi
-
-    # loop others through all running modes
-    trigger || (echo "TEST FAILED"; exit 1)
-else
+if [[ -z "$TEST_CASE_ARR" ]]; then
     # test all suite, ignore polybench and libsodium because of long time cost
-    TEST_CASE_ARR=("spec" "malformed" "standalone")
+    TEST_CASE_ARR=("unit" "spec" "malformed" "standalone")
     : '
     if [[ $COLLECT_CODE_COVERAGE == 1 ]];then
         # add polybench if collecting code coverage data
@@ -1250,9 +1343,38 @@ else
         TEST_CASE_ARR+=("libsodium")
     fi
     '
-    # loop through all running modes
-    trigger || (echo "TEST FAILED"; exit 1)
-    # Add more suites here
+fi
+
+# Unit tests use dedicated runtime mode configurations.
+if [[ " ${TEST_CASE_ARR[@]} " =~ " unit " ]]; then
+    if ! unit_test; then
+        echo "TEST FAILED"
+        exit 1
+    fi
+    collect_coverage unit
+
+    # remove 'unit' from TEST_CASE_ARR before running the other suites
+    TEST_CASE_ARR=("${TEST_CASE_ARR[@]/unit}")
+    TEST_CASE_ARR=($(remove_empty_elements "${TEST_CASE_ARR[@]}"))
+fi
+
+# Regression tests use dedicated runtime mode configurations as well.
+if [[ " ${TEST_CASE_ARR[@]} " =~ " regression " ]]; then
+    if ! regression_test; then
+        echo "TEST FAILED"
+        exit 1
+    fi
+    collect_coverage regression
+
+    # remove 'regression' from TEST_CASE_ARR before running the other suites
+    TEST_CASE_ARR=("${TEST_CASE_ARR[@]/regression}")
+    TEST_CASE_ARR=($(remove_empty_elements "${TEST_CASE_ARR[@]}"))
+fi
+
+# loop all remaining suites through all running modes
+if ! trigger; then
+    echo "TEST FAILED"
+    exit 1
 fi
 
 echo -e "Test finish. Reports are under ${REPORT_DIR}"

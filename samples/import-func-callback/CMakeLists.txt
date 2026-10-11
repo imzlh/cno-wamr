@@ -57,31 +57,21 @@ endif ()
 
 # build out vmlib
 set (WAMR_ROOT_DIR ${CMAKE_CURRENT_LIST_DIR}/../..)
+list (APPEND CMAKE_MODULE_PATH ${WAMR_ROOT_DIR}/build-scripts)
+find_package(WASISDK REQUIRED)
 include (${WAMR_ROOT_DIR}/build-scripts/runtime_lib.cmake)
 
 add_library(vmlib ${WAMR_RUNTIME_LIB_SOURCE})
 
 ################ wasm application ################
-if (NOT DEFINED WASI_SDK_DIR)
-    set (WASI_SDK_DIR "/opt/wasi-sdk")
-endif ()
-
-ExternalProject_Add(wasm_app
-    SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/wasm-apps
-    BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/wasm-apps
-    CONFIGURE_COMMAND ""
-    BUILD_COMMAND ${CMAKE_COMMAND} -E env
-        ${WASI_SDK_DIR}/bin/clang
-        -nostdlib
-        --target=wasm32
-        -Wl,--no-entry
-        -Wl,--export=test
-        -Wl,--allow-undefined
-        -o ${CMAKE_CURRENT_BINARY_DIR}/wasm-apps/test.wasm
-        ${CMAKE_CURRENT_SOURCE_DIR}/wasm-apps/test.c
-    BUILD_ALWAYS TRUE
-    INSTALL_COMMAND ""
-)
+# Build the wasm application through the standalone wasm-apps CMake project
+# (ExternalProject + wasi-sdk toolchain, so WAMR host flags don't leak into
+# the wasm build).
+include(${CMAKE_CURRENT_LIST_DIR}/../samples_common.cmake)
+samples_build_wasm_app(import_func_callback_wasm_apps wasm-apps
+  CONFIGURE_ARGS
+    -DWASI_SDK_PREFIX=${WASISDK_HOME}
+    -DCMAKE_TOOLCHAIN_FILE=${WASISDK_TOOLCHAIN})
 
 ################  application related  ################
 include_directories(${CMAKE_CURRENT_LIST_DIR}/src)
@@ -89,7 +79,7 @@ include (${SHARED_DIR}/utils/uncommon/shared_uncommon.cmake)
 
 add_executable (import-func-callback src/main.c ${UNCOMMON_SHARED_SOURCE})
 
-add_dependencies(import-func-callback wasm_app)
+add_dependencies(import-func-callback import_func_callback_wasm_apps)
 
 check_pie_supported()
 set_target_properties (import-func-callback PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -99,3 +89,13 @@ if (APPLE)
 else ()
   target_link_libraries (import-func-callback vmlib -lm -ldl -lpthread -lrt ${LLVM_AVAILABLE_LIBS})
 endif ()
+
+################  tests  ################
+include(CTest)
+include(${CMAKE_CURRENT_LIST_DIR}/../samples_common.cmake)
+
+if(BUILD_TESTING)
+  add_dependencies(import-func-callback import_func_callback_wasm_apps)
+
+  samples_add_test(import_func_callback "" $<TARGET_FILE:import-func-callback>)
+endif()

@@ -7,65 +7,12 @@ include(CheckPIESupported)
 
 project(socket_api_sample)
 
-#######################################
-## Detect toolchain
-#######################################
-message(CHECK_START "Detecting WASI-SDK at /opt/wasi-sdk")
-if(NOT (DEFINED WASI_SDK_DIR OR DEFINED CACHE{WASI_SDK_DIR}))
-  find_path(WASI_SDK_PARENT
-    wasi-sdk
-    PATHS /opt
-    NO_DEFAULT_PATH
-    NO_CMAKE_FIND_ROOT_PATH
-  )
-  if(WASI_SDK_PARENT)
-    set(WASI_SDK_DIR ${WASI_SDK_PARENT}/wasi-sdk)
-  endif()
-endif()
-if(WASI_SDK_DIR)
-  message(CHECK_PASS "found")
-else()
-  message(CHECK_FAIL "not found")
-endif()
-
-if(NOT EXISTS ${WASI_SDK_DIR})
-  message(FATAL_ERROR "Please install WASI-SDK under /opt/wasi-sdk")
-endif()
-
-message(CHECK_START "Detecting WASI_TOOLCHAIN_FILE at ${WASI_SDK_DIR}")
-find_file(WASI_TOOLCHAIN_FILE
-  wasi-sdk-pthread.cmake
-  PATHS "${WASI_SDK_DIR}/share/cmake"
-  NO_DEFAULT_PATH
-  NO_CMAKE_FIND_ROOT_PATH
-)
-if(WASI_TOOLCHAIN_FILE)
-  message(CHECK_PASS "found")
-else()
-  message(CHECK_FAIL "not found")
-endif()
-
-if(WASI_TOOLCHAIN_FILE-NOTFOUND)
-  message(FATAL_ERROR "Can not find wasi-sdk-pthread.cmake under ${WASI_SDK_DIR}")
-endif()
-
-message(CHECK_START "Detecting WASI_SYS_ROOT at ${WASI_SDK_DIR}")
-find_path(WASI_SYS_ROOT
-  wasi-sysroot
-  PATHS "${WASI_SDK_DIR}/share"
-  NO_DEFAULT_PATH
-  NO_CMAKE_FIND_ROOT_PATH
-)
-if(WASI_SYS_ROOT)
-  message(CHECK_PASS "found")
-  set(WASI_SYS_ROOT ${WASI_SYS_ROOT}/wasi-sysroot)
-else()
-  message(CHECK_FAIL "not found")
-endif()
-
-if(WASI_SYS_ROOT-NOTFOUND)
-  message(FATAL_ERROR "Can not find wasi-sysroot/ under ${WASI_SDK_DIR}")
-endif()
+get_filename_component(WAMR_ROOT_DIR "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+list(APPEND CMAKE_MODULE_PATH "${WAMR_ROOT_DIR}/build-scripts")
+find_package(WASISDK REQUIRED)
+set(WASI_SDK_DIR "${WASISDK_HOME}")
+set(WASI_TOOLCHAIN_FILE "${WASISDK_PTHREAD_TOOLCHAIN}")
+set(WASI_SYS_ROOT "${WASISDK_SYSROOT}")
 
 message(STATUS "WASI_SDK_DIR is ${WASI_SDK_DIR}")
 message(STATUS "WASI_TOOLCHAIN_FILE is ${WASI_TOOLCHAIN_FILE}")
@@ -190,3 +137,60 @@ add_executable (iwasm ${RUNTIME_SOURCE_ALL})
 check_pie_supported()
 set_target_properties (iwasm PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(iwasm vmlib -lpthread -lm -ldl)
+
+############################################
+## Tests
+############################################
+include(CTest)
+include(${CMAKE_CURRENT_LIST_DIR}/../samples_common.cmake)
+
+# Multicast and DNS scenarios are environment-sensitive (multicast group
+# membership, external DNS) and are NOT run by default. They can be enabled
+# with -DSOCKET_API_ENABLE_EXTRA_TESTS=ON.
+option(SOCKET_API_ENABLE_EXTRA_TESTS "Enable multicast/DNS socket-api tests" OFF)
+
+if(BUILD_TESTING)
+  add_dependencies(iwasm wasm-app)
+
+  set(SOCKET_API_PY ${CMAKE_CURRENT_LIST_DIR}/socket_test.py)
+
+  # Single-process scenarios (send/receive and socket options).
+  samples_add_test(socket_api_send_recv
+    "Send 106 bytes successfully!;Receive 106 bytes successfully!"
+    $<TARGET_FILE:iwasm> --addr-pool=127.0.0.1/0 ./send_recv.wasm)
+  samples_add_test(socket_api_socket_opts
+    "getsockopt SO_RCVTIMEO result is expected;\\[Client\\] Close sockets"
+    $<TARGET_FILE:iwasm> ./socket_opts.wasm)
+
+  # Two-process scenarios driven by socket_test.py (starts the server wasm,
+  # runs the client, kills the server).
+  samples_add_test(socket_api_tcp
+    "PASS \\[socket-api tcp\\]"
+    ${CMAKE_COMMAND} -E env PYTHONDONTWRITEBYTECODE=1
+    python3 ${SOCKET_API_PY} tcp ${CMAKE_CURRENT_BINARY_DIR})
+  samples_add_test(socket_api_udp
+    "PASS \\[socket-api udp\\]"
+    ${CMAKE_COMMAND} -E env PYTHONDONTWRITEBYTECODE=1
+    python3 ${SOCKET_API_PY} udp ${CMAKE_CURRENT_BINARY_DIR})
+  samples_add_test(socket_api_timeout
+    "PASS \\[socket-api timeout\\]"
+    ${CMAKE_COMMAND} -E env PYTHONDONTWRITEBYTECODE=1
+    python3 ${SOCKET_API_PY} timeout ${CMAKE_CURRENT_BINARY_DIR})
+
+  set_tests_properties(socket_api_tcp socket_api_udp socket_api_timeout
+    PROPERTIES RUN_SERIAL TRUE)
+
+  if(SOCKET_API_ENABLE_EXTRA_TESTS)
+    # multicast / addr_resolve are excluded from the default test set.
+    samples_add_test(socket_api_multicast
+      "PASS \\[socket-api multicast\\]"
+      ${CMAKE_COMMAND} -E env PYTHONDONTWRITEBYTECODE=1
+      python3 ${SOCKET_API_PY} multicast ${CMAKE_CURRENT_BINARY_DIR})
+    samples_add_test(socket_api_addr_resolve
+      "PASS \\[socket-api addr_resolve\\]"
+      ${CMAKE_COMMAND} -E env PYTHONDONTWRITEBYTECODE=1
+      python3 ${SOCKET_API_PY} addr_resolve ${CMAKE_CURRENT_BINARY_DIR})
+    set_tests_properties(socket_api_multicast socket_api_addr_resolve
+      PROPERTIES RUN_SERIAL TRUE)
+  endif()
+endif()

@@ -1,21 +1,11 @@
 # Copyright (C) 2024 Intel Corporation.  All rights reserved.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-cmake_minimum_required(VERSION 3.14)
+wamr_unit_test_suite_run_modes(exception-handling MODES classic-interp)
+if(NOT WAMR_UNIT_TEST_SUITE_ENABLED)
+  return()
+endif()
 
-project (test-exception-handling)
-
-add_definitions (-DRUN_ON_LINUX)
-
-add_definitions (-Dattr_container_malloc=malloc)
-add_definitions (-Dattr_container_free=free)
-
-set (WAMR_BUILD_AOT 0)
-set (WAMR_BUILD_INTERP 1)
-set (WAMR_BUILD_FAST_INTERP 0)
-set (WAMR_BUILD_JIT 0)
-set (WAMR_BUILD_LIBC_WASI 0)
-set (WAMR_BUILD_APP_FRAMEWORK 0)
 set (WAMR_BUILD_EXCE_HANDLING 1)
 
 include (../unit_common.cmake)

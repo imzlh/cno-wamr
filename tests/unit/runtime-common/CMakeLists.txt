@@ -1,28 +1,19 @@
 # Copyright (C) 2019 Intel Corporation.  All rights reserved.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-cmake_minimum_required(VERSION 3.14)
-
-project(test-runtime-common)
-
-add_definitions(-DRUN_ON_LINUX)
-
-set (WAMR_BUILD_AOT 1)
-set (WAMR_BUILD_FAST_INTERP 0)
-set (WAMR_BUILD_INTERP 1)
-set (WAMR_BUILD_JIT 0)
-set (WAMR_BUILD_LIBC_WASI 0)
-set (WAMR_BUILD_LIBC_BUILTIN 1)
-set (WAMR_BUILD_APP_FRAMEWORK 0)
+wamr_unit_test_suite_run_modes(runtime-common MODES aot)
+if(NOT WAMR_UNIT_TEST_SUITE_ENABLED)
+  return()
+endif()
+# Tests call the multi-module registration APIs unconditionally
+# (wasm_runtime_register_module_internal/_unregister_module/...).
 set (WAMR_BUILD_MULTI_MODULE 1)
+set (WAMR_BUILD_LIBC_BUILTIN 1)
 
 include(../unit_common.cmake)
 
-find_package(LLVM REQUIRED CONFIG)
-include_directories(SYSTEM ${LLVM_INCLUDE_DIRS})
-add_definitions(${LLVM_DEFINITIONS})
-
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+include_directories(${IWASM_DIR}/aot)
 
 file(GLOB_RECURSE source_all ${CMAKE_CURRENT_SOURCE_DIR}/*.cc)
 

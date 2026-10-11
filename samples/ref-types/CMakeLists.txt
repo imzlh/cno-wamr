@@ -77,7 +77,7 @@ if (NOT MSVC)
 endif()
 # build out vmlib
 set(WAMR_ROOT_DIR ${CMAKE_CURRENT_LIST_DIR}/../..)
-set(WAMRC ${WAMR_ROOT_DIR}/wamr-compiler/build/wamrc)
+list(APPEND CMAKE_MODULE_PATH ${WAMR_ROOT_DIR}/build-scripts)
 include (${WAMR_ROOT_DIR}/build-scripts/runtime_lib.cmake)
 
 add_library(vmlib STATIC ${WAMR_RUNTIME_LIB_SOURCE})
@@ -86,21 +86,7 @@ if (MSVC)
 endif()
 
 ################  application related  ################
-## locate wat2wasm
-find_program(WAT2WASM
-  wat2wasm
-  PATHS /opt/wabt/bin
-  REQUIRED
-)
-
-if(NOT WAT2WASM)
-  message(SEND_ERROR "can not find wat2wasm")
-else ()
-  execute_process(COMMAND ${WAT2WASM} --version
-                  OUTPUT_VARIABLE WAT2WASM_VERSION_OUTPUT)
-  string(STRIP ${WAT2WASM_VERSION_OUTPUT} WAT2WASM_VERSION)
-  message("-- Found wat2wasm ${WAT2WASM_VERSION}")
-endif()
+find_package(WABT REQUIRED COMPONENTS wat2wasm)
 
 if (${WAT2WASM_VERSION} VERSION_LESS 1.0.26)
   set(WAT2WASM_FLAGS "--enable-reference-types")
@@ -130,3 +116,15 @@ add_custom_target(hello_wasm ALL
   VERBATIM
   SOURCES ${WAT_FILE}
 )
+
+################  tests  ################
+include(CTest)
+include(${CMAKE_CURRENT_LIST_DIR}/../samples_common.cmake)
+
+if(BUILD_TESTING)
+  add_dependencies(hello hello_wasm)
+
+  samples_add_test(ref_types
+    "GREAT! PASS ALL CHKs"
+    $<TARGET_FILE:hello>)
+endif()

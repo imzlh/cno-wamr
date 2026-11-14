@@ -2554,6 +2554,15 @@ adjust_table_max_size(bool is_table64, uint32 init_size, uint32 max_size_flag,
     /* TODO: current still use UINT32_MAX as upper limit for table size to keep
      * ABI unchanged */
     (void)is_table64;
+
+    if (max_size_flag) {
+        /* A declared maximum is observable through table.grow(). Preserve it
+         * and reject the instance on allocation failure instead of silently
+         * reducing the module's limit. */
+        bh_assert(init_size <= *max_size);
+        return;
+    }
+
     if (UINT32_MAX / 2 > init_size)
         default_max_size = init_size * 2;
     else
@@ -2562,19 +2571,8 @@ adjust_table_max_size(bool is_table64, uint32 init_size, uint32 max_size_flag,
     if (default_max_size < WASM_TABLE_MAX_SIZE)
         default_max_size = WASM_TABLE_MAX_SIZE;
 
-    if (max_size_flag) {
-        /* module defines the table limitation */
-        bh_assert(init_size <= *max_size);
-
-        if (init_size < *max_size) {
-            *max_size =
-                *max_size < default_max_size ? *max_size : default_max_size;
-        }
-    }
-    else {
-        /* partial defined table limitation, gives a default value */
-        *max_size = default_max_size;
-    }
+    /* Partial table limitation: give it a default maximum. */
+    *max_size = default_max_size;
 }
 
 #if WASM_ENABLE_LIBC_WASI != 0 || WASM_ENABLE_MULTI_MODULE != 0

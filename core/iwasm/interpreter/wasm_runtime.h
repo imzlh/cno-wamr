@@ -187,6 +187,12 @@ struct WASMTableInstance {
     uint32 cur_size;
     /* Maximum size */
     uint32 max_size;
+#if WASM_ENABLE_GC == 0 && WASM_ENABLE_REF_TYPES != 0
+    /* A non-GC funcref value is only a module-relative function index.  Keep
+     * the defining instance beside every slot so a shared/imported table does
+     * not reinterpret provider function N as consumer function N. */
+    WASMModuleInstance **func_owners;
+#endif
     /* Table elements */
     table_elem_type_t elems[1];
 };
@@ -237,6 +243,11 @@ struct WASMFunctionInstance {
         WASMFunctionImport *func_import;
         WASMFunction *func;
     } u;
+    /* Native import linkage is instance-scoped. Defined wasm functions leave
+     * these fields zeroed. */
+    const char *import_signature;
+    void *import_attachment;
+    bool import_call_conv_raw;
 #if WASM_ENABLE_MULTI_MODULE != 0
     WASMModuleInstance *import_module_inst;
     WASMFunctionInstance *import_func_inst;
@@ -362,6 +373,10 @@ typedef struct WASMModuleInstanceExtra {
     /* linked table instances of import table instances */
     WASMTableInstance **table_insts_linked;
 #endif
+
+    /* One byte per memory. A borrowed imported memory is owned by another
+     * live module instance and must not have its backing freed here. */
+    uint8 *memory_insts_borrowed;
 
 #if WASM_ENABLE_TAGS != 0
     uint32 tag_count;
@@ -713,6 +728,28 @@ wasm_elem_is_declarative(uint32 mode)
 bool
 wasm_enlarge_table(WASMModuleInstance *module_inst, uint32 table_idx,
                    uint32 inc_entries, table_elem_type_t init_val);
+
+#if WASM_ENABLE_GC == 0 && WASM_ENABLE_REF_TYPES != 0
+bool
+wasm_table_set_elem(WASMModuleInstance *value_owner,
+                    WASMTableInstance *table_inst, uint32 elem_idx,
+                    table_elem_type_t value);
+
+bool
+wasm_table_copy_elems(WASMTableInstance *dst_table, uint32 dst_offset,
+                      WASMTableInstance *src_table, uint32 src_offset,
+                      uint32 length);
+
+bool
+wasm_table_fill_elems(WASMModuleInstance *value_owner,
+                      WASMTableInstance *table_inst, uint32 offset,
+                      uint32 length, table_elem_type_t value);
+
+WASMModuleInstance *
+wasm_table_get_func_owner(WASMTableInstance *table_inst, uint32 elem_idx,
+                          WASMModuleInstance *default_owner);
+
+#endif
 #endif /* WASM_ENABLE_REF_TYPES != 0 || WASM_ENABLE_GC != 0 */
 
 #if WASM_ENABLE_GC != 0

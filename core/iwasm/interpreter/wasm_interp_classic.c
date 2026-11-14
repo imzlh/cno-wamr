@@ -1272,16 +1272,16 @@ wasm_interp_call_func_native(WASMModuleInstance *module_inst,
             argv_ret[1] = frame->lp[1];
         }
     }
-    else if (!func_import->call_conv_raw) {
+    else if (!cur_func->import_call_conv_raw) {
         ret = wasm_runtime_invoke_native(
             exec_env, native_func_pointer, func_import->func_type,
-            func_import->signature, func_import->attachment, frame->lp,
+            cur_func->import_signature, cur_func->import_attachment, frame->lp,
             cur_func->param_cell_num, argv_ret);
     }
     else {
         ret = wasm_runtime_invoke_native_raw(
             exec_env, native_func_pointer, func_import->func_type,
-            func_import->signature, func_import->attachment, frame->lp,
+            cur_func->import_signature, cur_func->import_attachment, frame->lp,
             cur_func->param_cell_num, argv_ret);
     }
 
@@ -1564,6 +1564,10 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                                WASMFunctionInstance *cur_func,
                                WASMInterpFrame *prev_frame)
 {
+#if WASM_ENABLE_GC == 0 && WASM_ENABLE_MULTI_MODULE != 0
+    WASMFunctionInstance cross_module_func;
+    WASMFunctionImport cross_module_import;
+#endif
     WASMMemoryInstance *memory = wasm_get_default_memory(module);
 #if !defined(OS_ENABLE_HW_BOUND_CHECK)              \
     || WASM_CPU_SUPPORTS_UNALIGNED_ADDR_ACCESS == 0 \
@@ -2420,18 +2424,24 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 #endif
                 /* clang-format on */
 
+#if WASM_ENABLE_GC == 0
+                WASMModuleInstance *func_owner = wasm_table_get_func_owner(
+                    tbl_inst, (uint32)val, module);
+#else
+                WASMModuleInstance *func_owner = module;
+#endif
+
                 /*
                  * we might be using a table injected by host or
                  * another module. In that case, we don't validate
                  * the elem value while loading
                  */
-                if (fidx >= module->e->function_count) {
+                if (fidx >= func_owner->e->function_count) {
                     wasm_set_exception(module, "unknown function");
                     goto got_exception;
                 }
 
-                /* always call module own functions */
-                cur_func = module->e->functions + fidx;
+                cur_func = func_owner->e->functions + fidx;
 
                 if (cur_func->is_import_func)
                     cur_func_type = cur_func->u.func_import->func_type;
@@ -2440,7 +2450,10 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
                 /* clang-format off */
 #if WASM_ENABLE_GC == 0
-                if (cur_type != cur_func_type) {
+                if (!wasm_type_equal((WASMType *)cur_type,
+                                     (WASMType *)cur_func_type,
+                                     module->module->types,
+                                     module->module->type_count)) {
                     wasm_set_exception(module, "indirect call type mismatch");
                     goto got_exception;
                 }
@@ -2451,6 +2464,20 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 }
 #endif
                 /* clang-format on */
+
+#if WASM_ENABLE_GC == 0 && WASM_ENABLE_MULTI_MODULE != 0
+                if (func_owner != module) {
+                    memset(&cross_module_import, 0,
+                           sizeof(cross_module_import));
+                    cross_module_import.func_type = cur_func_type;
+                    cross_module_func = *cur_func;
+                    cross_module_func.is_import_func = true;
+                    cross_module_func.u.func_import = &cross_module_import;
+                    cross_module_func.import_module_inst = func_owner;
+                    cross_module_func.import_func_inst = cur_func;
+                    cur_func = &cross_module_func;
+                }
+#endif
 
 #if WASM_ENABLE_TAIL_CALL != 0
                 if (opcode == WASM_OP_RETURN_CALL_INDIRECT)
@@ -2596,7 +2623,16 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                     goto got_exception;
                 }
 
+#if WASM_ENABLE_GC == 0
+                if (!wasm_table_set_elem(module, tbl_inst, (uint32)elem_idx,
+                                         elem_val)) {
+                    wasm_set_exception(module,
+                                       "failed to retain table element");
+                    goto got_exception;
+                }
+#else
                 tbl_inst->elems[elem_idx] = elem_val;
+#endif
                 HANDLE_OP_END();
             }
 
@@ -5977,8 +6013,14 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                                       || init_values[i].init_expr_type
                                              == INIT_EXPR_TYPE_FUNCREF_CONST);
 #if WASM_ENABLE_GC == 0
-                            table_elems[i] = (table_elem_type_t)init_values[i]
-                                                 .u.unary.v.ref_index;
+                            if (!wasm_table_set_elem(
+                                    module, tbl_inst, (uint32)d + i,
+                                    (table_elem_type_t)init_values[i]
+                                        .u.unary.v.ref_index)) {
+                                wasm_set_exception(
+                                    module, "failed to retain table element");
+                                goto got_exception;
+                            }
 #else
                             if (init_values[i].u.unary.v.ref_index
                                 != UINT32_MAX) {
@@ -6054,15 +6096,13 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                         /* if s >= d, copy from front to back */
                         /* if s < d, copy from back to front */
                         /* merge all together */
-                        bh_memmove_s((uint8 *)dst_tbl_inst
-                                         + offsetof(WASMTableInstance, elems)
-                                         + d * sizeof(table_elem_type_t),
-                                     (uint32)((dst_tbl_inst->cur_size - d)
-                                              * sizeof(table_elem_type_t)),
-                                     (uint8 *)src_tbl_inst
-                                         + offsetof(WASMTableInstance, elems)
-                                         + s * sizeof(table_elem_type_t),
-                                     (uint32)(n * sizeof(table_elem_type_t)));
+                        if (!wasm_table_copy_elems(
+                                dst_tbl_inst, (uint32)d, src_tbl_inst,
+                                (uint32)s, (uint32)n)) {
+                            wasm_set_exception(
+                                module, "failed to retain table element");
+                            goto got_exception;
+                        }
                         break;
                     }
                     case WASM_OP_TABLE_GROW:
@@ -6153,8 +6193,12 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                             goto got_exception;
                         }
 
-                        for (; n != 0; elem_idx++, n--) {
-                            tbl_inst->elems[elem_idx] = fill_val;
+                        if (!wasm_table_fill_elems(
+                                module, tbl_inst, (uint32)elem_idx,
+                                (uint32)n, fill_val)) {
+                            wasm_set_exception(
+                                module, "failed to retain table element");
+                            goto got_exception;
                         }
                         break;
                     }

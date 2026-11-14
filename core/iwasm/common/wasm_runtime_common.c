@@ -2341,7 +2341,8 @@ wasm_runtime_get_export_table_inst(WASMModuleInstanceCommon *const module_inst,
             if ((wasm_export->kind == WASM_IMPORT_EXPORT_KIND_TABLE)
                 && !strcmp(wasm_export->name, name)) {
                 const WASMTableInstance *wasm_table_inst =
-                    wasm_module_inst->tables[wasm_export->index];
+                    wasm_get_table_inst(wasm_module_inst,
+                                        wasm_export->index);
                 table_inst->elem_kind =
                     val_type_to_val_kind(wasm_table_inst->elem_type);
                 table_inst->cur_size = wasm_table_inst->cur_size;
@@ -6562,8 +6563,10 @@ typedef struct ExternRefMapNode {
     void *extern_obj;
     /* The module instance it belongs to */
     WASMModuleInstanceCommon *module_inst;
-    /* Whether it is retained */
-    bool retained;
+    /* Explicit owners outside the creating module, e.g. shared Table slots. */
+    uint32 retain_count;
+    /* The creating module has been destroyed; delete after the final retain. */
+    bool creator_dead;
     /* Whether it is marked by runtime */
     bool marked;
     /* cleanup function called when the externref is freed */
@@ -6805,7 +6808,7 @@ reclaim_extobj_callback(void *key, void *value, void *user_data)
         (WASMModuleInstanceCommon *)user_data;
 
     if (node->module_inst == module_inst) {
-        if (!node->marked && !node->retained) {
+        if (!node->marked && node->retain_count == 0) {
             delete_externref(key, node);
         }
         else {
@@ -6886,7 +6889,7 @@ aot_mark_all_externrefs(AOTModuleInstance *module_inst)
     }
 
     for (i = 0; i < module->table_count; i++) {
-        table_inst = module_inst->tables[i];
+        table_inst = wasm_get_table_inst(module_inst, i);
         if ((table + i)->table_type.elem_type == VALUE_TYPE_EXTERNREF) {
             while (j < table_inst->cur_size) {
                 mark_externref(table_inst->elems[j++]);
@@ -6922,7 +6925,16 @@ cleanup_extobj_callback(void *key, void *value, void *user_data)
         (WASMModuleInstanceCommon *)user_data;
 
     if (node->module_inst == module_inst) {
-        delete_externref(key, node);
+        if (node->retain_count == 0)
+            delete_externref(key, node);
+        else {
+            /* A shared backing (most importantly an imported externref Table)
+             * still owns this object. Detach it from the dead creator so a
+             * later cleanup cannot invalidate a live slot. */
+            node->module_inst = NULL;
+            node->creator_dead = true;
+            node->marked = false;
+        }
     }
 }
 
@@ -6946,12 +6958,36 @@ wasm_externref_retain(uint32 externref_idx)
         node =
             bh_hash_map_find(externref_map, (void *)(uintptr_t)externref_idx);
         if (node) {
-            node->retained = true;
+            if (node->retain_count == UINT32_MAX) {
+                os_mutex_unlock(&externref_lock);
+                return false;
+            }
+            node->retain_count++;
             os_mutex_unlock(&externref_lock);
             return true;
         }
     }
 
+    os_mutex_unlock(&externref_lock);
+    return false;
+}
+
+bool
+wasm_externref_release(uint32 externref_idx)
+{
+    ExternRefMapNode *node;
+
+    os_mutex_lock(&externref_lock);
+    if (externref_idx != NULL_REF
+        && (node = bh_hash_map_find(
+                externref_map, (void *)(uintptr_t)externref_idx))
+        && node->retain_count > 0) {
+        node->retain_count--;
+        if (node->retain_count == 0 && node->creator_dead)
+            delete_externref((void *)(uintptr_t)externref_idx, node);
+        os_mutex_unlock(&externref_lock);
+        return true;
+    }
     os_mutex_unlock(&externref_lock);
     return false;
 }

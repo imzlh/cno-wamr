@@ -618,10 +618,44 @@ wasm_runtime_get_exec_env_tls(void);
 struct InstantiationArgs2 {
     InstantiationArgs v1;
     void *custom_data;
+    /* Instance-scoped WebAssembly extern imports supplied by an embedder.
+     *
+     * WAMR's ordinary import linker stores linkage on WASMModule, which is
+     * unsuitable when the same compiled module is instantiated repeatedly
+     * with different live externs.  These bindings are consulted only while
+     * constructing this instance and point at already-live provider
+     * instances.  The embedder owns the provider lifetimes. */
+    const struct WASMExternBinding *extern_bindings;
+    uint32 extern_binding_count;
+    /* Native function imports whose callback and attachment belong to this
+     * particular instance rather than to the compiled module or WAMR's
+     * process-global native-symbol registry. */
+    const struct WASMHostFunctionBinding *host_function_bindings;
+    uint32 host_function_binding_count;
 #if WASM_ENABLE_LIBC_WASI != 0
     WASIArguments wasi;
 #endif
 };
+
+typedef struct WASMExternBinding {
+    uint8 kind;
+    /* When set, source_index names an earlier import of the same kind in the
+     * instance currently being constructed. Otherwise it names an extern in
+     * source_instance. */
+    uint8 source_is_import;
+    uint8 reserved[2];
+    uint32 import_index;
+    WASMModuleInstanceCommon *source_instance;
+    uint32 source_index;
+} WASMExternBinding;
+
+typedef struct WASMHostFunctionBinding {
+    uint32 import_index;
+    void *func_ptr;
+    const char *signature;
+    void *attachment;
+    bool call_conv_raw;
+} WASMHostFunctionBinding;
 
 void
 wasm_runtime_instantiation_args_set_defaults(struct InstantiationArgs2 *args);
@@ -1225,6 +1259,11 @@ wasm_externref_ref2obj(uint32 externref_idx, void **p_extern_obj);
 /* See wasm_export.h for description */
 WASM_RUNTIME_API_EXTERN bool
 wasm_externref_retain(uint32 externref_idx);
+
+/* Release one explicit retain.  A retained externref whose creating module has
+ * already been destroyed is deleted when its final retain is released. */
+WASM_RUNTIME_API_EXTERN bool
+wasm_externref_release(uint32 externref_idx);
 
 /**
  * Reclaim the externref objects/indexes which are not used by
